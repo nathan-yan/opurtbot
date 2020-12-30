@@ -133,8 +133,10 @@ class ServerThread (threading.Thread):
         run_minecraft([])
 
 class Spinup(discord.Client):
-    def __init__(self):
+    def __init__(self, sock):
         super().__init__() 
+
+        self.sock = sock 
 
         self.voting = False 
         self.voted = set()
@@ -382,7 +384,7 @@ class Spinup(discord.Client):
         elif message.content.startswith("!spindown"):
             await message.channel.send("spinning down the minecraft server")
 
-            q.put("quit")
+            self.sock.emit('quit')
             self.running = False
 
         elif message.content.startswith("!isup"):

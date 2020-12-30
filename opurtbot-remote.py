@@ -2,6 +2,7 @@ import discord
 from discord.ext import tasks, commands
 
 import asyncio
+import socketio
 import threading
 
 import subprocess
@@ -15,107 +16,15 @@ import os
 
 import re
 
-chat_reg = re.compile("<[^ ]+>")
+import boto3
+import utils
 
-q = Queue()
-inq = Queue()       # queue for discord -> minecraft communication
-outq = Queue()      # queue for minecraft -> discord communication 
+client = boto3.client('ec2')
+
+chat_reg = re.compile("<[^ ]+>")
 
 active_players = set()
 
-def enqueue(out, queue):
-    for line in iter(out.readline, b''):
-        queue.put(line)
-    
-    out.close()
-
-def run_minecraft(command): 
-    p = subprocess.Popen(["java", "-jar","-Xmx11000M", "-Xms11000M", "forge-1.16.1-32.0.107.jar", "nogui"],
-                     stdout=subprocess.PIPE,
-                     stdin = subprocess.PIPE,
-                     stderr=subprocess.STDOUT,
-                     )
-
-    t = Thread(target = enqueue, args = (p.stdout, q))
-
-    t.daemon = True
-    t.start()
-
-    cc = 0
-    while True:
-        cc += 1
-
-        while not inq.empty():
-            # push commands into the subprocess
-            item = inq.get()
-
-            print(item)
-
-            if item['task'] == 'message-minecraft':
-                print(item)
-
-                command = 'tellraw @a {"text": "[%s] %s", "color" : "green"}' % (item['user'], item['message'].replace('\n', ' | '))
-                p.stdin.write((command + "\n").encode())
-                p.stdin.flush()
-
-        try:
-            line = q.get(timeout = 0.5)
-            if line == 'quit':
-                print("quit the minecraft thread")
-                p.kill  ()
-                break;
-
-            line = line.decode()
-            print(line)
-
-            if "joined the game" in line:
-                end_idx = line.index(" joined the game")
-                start_idx = line.rindex(' ', 0, end_idx)
-
-                name = line[start_idx + 1: end_idx]
-
-                active_players.add(name)
-
-                outq.put({
-                    "task" : "message-discord-joinleave",
-                    "user" : name,
-                    "message" : "%s joined the game 💎" % name
-                })
-
-            elif "left the game" in line:
-                end_idx = line.index(" left the game")
-                start_idx = line.rindex(' ', 0, end_idx)
-
-                name = line[start_idx + 1: end_idx]
-
-                active_players.remove(name)
-
-                outq.put({
-                    "task" : "message-discord-joinleave",
-                    "user" : name,
-                    "message" : "%s left the game 🏃" % name
-                })
-
-            match = chat_reg.search(line)
-            if match:
-                print("found match!")
-
-                span = match.span()
-
-                user = line[span[0] + 1 : span[1] - 1]
-                message = line[span[1] + 1 : -2]
-
-                outq.put({
-                    "task" : "message-discord",
-                    "user" : user,
-                    "message" : message
-                })
-
-        except:
-            if cc % 10 == 0:
-                print(".")
-
-    return
 
 class SpinupThread (threading.Thread):
    def __init__(self, ):
@@ -150,6 +59,7 @@ class Spinup(discord.Client):
         self.ip = None
 
         self.vc = None
+        self.sock = None
 
     async def on_ready(self):
         print('Logged on as {0}!'.format(self.user))
@@ -164,7 +74,7 @@ class Spinup(discord.Client):
             if (message.author == client.user) and message.content.startswith("```"):
                 return
 
-            inq.put({
+            await self.sock.emit('discord-chat', {
                 "task" : 'message-minecraft',
                 "message" : message.content,
                 "user" : message.author.nick
@@ -382,7 +292,12 @@ class Spinup(discord.Client):
         elif message.content.startswith("!spindown"):
             await message.channel.send("spinning down the minecraft server")
 
-            q.put("quit")
+            # tell the minecraft server to gracefully shut down
+            await self.sock.emit("quit")
+
+            # then spin down the server
+            utils.alter_instance(os.environ['EC2_INSTANCE_ID'], state = 'OFF')
+
             self.running = False
 
         elif message.content.startswith("!isup"):
@@ -408,8 +323,9 @@ class Spinup(discord.Client):
         self.voted = set()
 
         if (not self.running):
-            m = ServerThread()
-            m.start()
+            # spin up the server 
+            utils.alter_instance(os.environ['EC2_INSTANCE_ID'], state = 'ON')
+
 
             self.running = True
             self.upsince = time.time()
@@ -417,6 +333,44 @@ class Spinup(discord.Client):
 client = Spinup()
 
 async def check_messages(ctx):
+    await ctx.wait_until_ready()
+
+    sock = socketio.AsyncClient(logger = True)
+
+    @sock.event
+    def connect():
+        print("I'm connected!")
+
+    @sock.event
+    async def connect_error():
+        print("The connection failed!")
+
+    @sock.event
+    def disconnect():
+        print("I'm disconnected!")
+
+    @sock.on("joinleave")
+    async def joinleave(data):
+        if data['task'] == 'message-discord-joinleave':
+                    
+            user = data['user']
+            message = data['message']
+
+            await ctx.dimensional_rift.send(message)
+    
+    @sock.on('minecraft-chat')
+    async def chat(data):
+        if data['task'] == 'message-discord':
+            #channel = discord.utils.get(ctx.get_all_channels(), name = "dimensional-rift")
+            #print(channel)
+            if not data['message'].endswith("Disconnected"):
+                await ctx.dimensional_rift.send("```diff\n+ <%s> %s```" % (data['user'], data['message']))
+
+
+    await sock.connect(url = "http://0.0.0.0:8001")
+    
+    ctx.sock = sock
+
     last_message = None
 
     prev_topic = ""
@@ -481,6 +435,7 @@ async def check_messages(ctx):
 
                 await ctx.voteChannel.send("the vote will end in 2 MINUTES")
 
+            """
             while not outq.empty():
                 item = outq.get()
 
@@ -496,9 +451,20 @@ async def check_messages(ctx):
                     message = item['message']
 
                     await ctx.dimensional_rift.send(message)
+            """
 
         await asyncio.sleep(0.1)
 
-client.loop.create_task(check_messages(client))
+async def main():
+    pass
 
-client.run(os.environ['DISCORD_TOKEN'])
+if __name__ == '__main__':
+    client.loop.create_task(check_messages(client))
+
+    client.run(os.environ['DISCORD_TOKEN'])
+
+    #loop = asyncio.get_event_loop()
+    #loop.run_until_complete(client.start(os.environ['DISCORD_TOKEN']))
+    #loop.close()
+    #print("closed")
+    #asyncio.run(main())
