@@ -60,6 +60,7 @@ class Spinup(discord.Client):
 
         self.vc = None
         self.sock = None
+        self.sock_connected = False 
 
     async def on_ready(self):
         print('Logged on as {0}!'.format(self.user))
@@ -295,6 +296,9 @@ class Spinup(discord.Client):
             # tell the minecraft server to gracefully shut down
             await self.sock.emit("quit")
 
+            # dc from the websocket connection
+            await self.sock.disconnect()
+
             # then spin down the server
             utils.alter_instance(os.environ['EC2_INSTANCE_ID'], state = 'OFF')
 
@@ -312,13 +316,15 @@ class Spinup(discord.Client):
                 await message.channel.send("the server is not currently up")
             
         elif message.content.startswith("!ip"):
-            self.ip = get('https://api.ipify.org').text
-            await message.channel.send("`%s:25565`" % (get('https://api.ipify.org').text))
+            self.ip = client.describe_instances()['Reservations'][0]['Instances'][0]['NetworkInterfaces'][0]['Association']['PublicIp']
+
+            await message.channel.send("`%s:25565`" % (self.ip))
     
     async def spinup(self, message):
-        await message.channel.send("vote succeeded, spinning up minecraft @ %s:25565" % (get('https://api.ipify.org').text))
-        self.ip = get('https://api.ipify.org').text
+        self.ip = client.describe_instances()['Reservations'][0]['Instances'][0]['NetworkInterfaces'][0]['Association']['PublicIp']
 
+        await message.channel.send("vote succeeded, spinning up minecraft @ %s:25565" % self.ip)
+        
         self.voting = False
         self.voted = set()
 
@@ -326,19 +332,20 @@ class Spinup(discord.Client):
             # spin up the server 
             utils.alter_instance(os.environ['EC2_INSTANCE_ID'], state = 'ON')
 
-
             self.running = True
             self.upsince = time.time()
             
 client = Spinup()
 
+c = 0
 async def check_messages(ctx):
     await ctx.wait_until_ready()
 
-    sock = socketio.AsyncClient(logger = True)
+    sock = socketio.AsyncClient(logger = True, reconnection_attempts=1)
 
     @sock.event
     def connect():
+        ctx.sock_connected = True
         print("I'm connected!")
 
     @sock.event
@@ -347,6 +354,7 @@ async def check_messages(ctx):
 
     @sock.event
     def disconnect():
+        ctx.sock_connected = False
         print("I'm disconnected!")
 
     @sock.on("joinleave")
@@ -366,15 +374,26 @@ async def check_messages(ctx):
             if not data['message'].endswith("Disconnected"):
                 await ctx.dimensional_rift.send("```diff\n+ <%s> %s```" % (data['user'], data['message']))
 
-
-    await sock.connect(url = "http://0.0.0.0:8001")
-    
-    ctx.sock = sock
-
     last_message = None
 
     prev_topic = ""
+    c = 0
     while True:
+        c += 1
+
+        # establish connection to the aws instance
+        # we're going to run this every 2 seconds
+        if ctx.running and (time.time() - ctx.upsince) > 100 and not ctx.sock_connected and c % 20 == 0:
+            try:
+                instances = client.describe_instances()
+                ip_addr = instances['Reservations'][0]['Instances'][0]['NetworkInterfaces'][0]['Association']['PublicIp']
+                
+                await sock.connect(url = 'https://{}:5000'.format(ip_addr))
+            except:
+                print("attempted to connect and failed.")
+        
+        ctx.sock = sock
+
         if ctx.dimensional_rift and ctx.server_status:
             if not last_message:
                 last_message = ctx.server_status.last_message_id 
